@@ -1,0 +1,14 @@
+# Entorno
+.venv/
+__pycache__/
+.DS_Store
+
+# Libros, traducciones y archivos de trabajo (pueden tener derechos de autor)
+*.epub
+*.epub.tmp
+work/
+*.log
+
+# Notas locales y scripts obsoletos
+CONTEXTO.md
+fix_epub.py
