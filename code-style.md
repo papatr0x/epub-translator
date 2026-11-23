@@ -21,7 +21,8 @@
 
 ## Run
 ```bash
-.venv/bin/python -u translate_epub.py input.epub > translation.log 2>&1 &
+.venv/bin/python translate_epub.py input.epub                          # shows plan, asks to confirm
+.venv/bin/python -u translate_epub.py input.epub -q > translation.log 2>&1 &   # no prompt (required in background)
 .venv/bin/python build_epub.py input.epub   # partial or full EPUB from the cache
 ```
 Working files live in `work/<epub name>/` (`src/` extracted original, `cache_*.jsonl` translation progress, `build/` last built EPUB contents).

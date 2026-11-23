@@ -64,17 +64,19 @@ Otras decisiones:
    llevar un registro aparte que pueda desincronizarse. Parsear HTML cuesta
    milisegundos; traducir, segundos: recalcular el plan es gratis.
 
-7. Orden de lectura + respaldos inmediatos  (spine_files, on_md/on_done)
-   Se traduce en el orden del spine, con los títulos del índice primero. Si el
-   modelo rompe la cursiva de un párrafo, su respaldo en texto plano se encola
-   al momento, no al final del libro. Así cada capítulo queda completo apenas
-   se traduce, y build_epub.py puede armar un EPUB parcial en cualquier momento.
+7. Orden de lectura  (spine_files)
+   Se traduce en el orden del spine, con los títulos del índice primero. Así
+   cada capítulo queda completo apenas se traduce, y build_epub.py puede armar
+   un EPUB parcial en cualquier momento. Cada párrafo necesita una sola
+   traducción: aunque el modelo altere el Markdown, la salida se aprovecha.
 
 8. Unidad = párrafo, formato como Markdown  (sección "Unidades de traducción")
    Traducir el párrafo entero da contexto al modelo y conserva la estructura.
    Las etiquetas inline se pasan como Markdown (*x*, **x**) porque el modelo
    lo vio mucho en su entrenamiento y lo respeta; las etiquetas tipo XML
-   (<g1>...</g1>) las descartaba casi siempre.
+   (<g1>...</g1>) las descartaba casi siempre. Al volver, el Markdown se
+   convierte en HTML de forma tolerante (md_to_nodes): un marcador cambiado
+   no tira el formato de todo el párrafo, y ningún asterisco llega al libro.
 
 9. Validación y reintento  (output_problem, translate_many)
    La decodificación greedy a veces cae en bucles ("die die die...") o, ante
@@ -92,21 +94,28 @@ Otras decisiones:
     build_epub.py reutiliza este módulo sin cargar el modelo ni la GPU.
 
 Uso:
-    .venv/bin/python translate_epub.py <entrada.epub> [--src de] [--tgt es] [--batch 16]
+    .venv/bin/python translate_epub.py <entrada.epub> [--src de] [--tgt es] [--batch 16] [-q]
 
-Ejemplo:
+Antes de empezar muestra el plan (cuánto falta, tiempo estimado) y pide
+confirmación. -q empieza sin preguntar; es obligatorio en segundo plano.
+
+Ejemplos:
     .venv/bin/python translate_epub.py input.epub
+    .venv/bin/python -u translate_epub.py input.epub -q > translation.log 2>&1 &
 """
 
 import argparse
 import hashlib
 import json
+import os
 import posixpath
 import re
 import shlex
+import shutil
 import sys
 import time
 import zipfile
+from collections import deque
 from pathlib import Path
 from typing import Callable
 from urllib.parse import unquote
@@ -130,6 +139,9 @@ MAX_TOKENS_MARGIN = 64
 # de cada secuencia activa) crece con el número de secuencias y se duplica.
 BATCH_SIZE = 16
 PROGRESS_EVERY_S = 30
+# Velocidad de referencia para estimar la duración antes de empezar (medida en un
+# M5 Pro con batch 16). Es solo orientativa: depende de la máquina y del batch.
+REF_SECONDS_PER_TEXT = 0.36
 # Reintento ante salidas malas (docstring, punto 9). La penalización divide los
 # logits de los tokens generados en los últimos RETRY_REPETITION_CONTEXT pasos,
 # así que repetir lo mismo pierde probabilidad y el bucle se rompe. 1.2 corrigió
@@ -163,8 +175,6 @@ INLINE_TAGS = {
 # accede a las traducciones: según qué lookup se le pase, el mismo código sirve
 # para planificar (anotar lo que falta) o para aplicar (docstring, punto 6).
 Lookup = Callable[[str], "str | None"]
-# on_md(texto_md, marcadores_esperados, texto_plano_de_respaldo)
-OnMd = Callable[[str, list, str], None]
 
 # Inline que se traduce como Markdown (y se reconstruye)
 MD_TAGS = {"em": "*", "i": "*", "cite": "*", "dfn": "*", "var": "*",
@@ -285,13 +295,11 @@ class Translator:
         n_in = len(self.tokenizer.encode(text))
         return prompt, int(n_in * MAX_TOKENS_FACTOR) + MAX_TOKENS_MARGIN
 
-    def translate_many(self, texts: list[str], failed: set[str],
-                       on_done: Callable[[str, str], list[str]] | None = None):
+    def translate_many(self, texts: list[str], failed: set[str]):
         """Traduce `texts` y guarda cada resultado en la caché apenas termina.
         Si la salida es mala (bucle, cortada, demasiado larga) se reintenta una vez
         con penalización de repetición; si vuelve a fallar se conserva el texto
-        original. `on_done(texto, resultado)` puede devolver textos extra, que se
-        traducen a continuación. Los textos con error se agregan a `failed`."""
+        original. Los textos con error se agregan a `failed`."""
         from mlx_lm.generate import BatchGenerator
         from mlx_lm.sample_utils import make_logits_processors
         if self.model is None:
@@ -307,8 +315,8 @@ class Translator:
             repetition_penalty=RETRY_REPETITION_PENALTY,
             repetition_context_size=RETRY_REPETITION_CONTEXT)
         # Pila invertida: pop() saca del final en O(1) y respeta el orden original
-        # (orden de lectura). Lo que se agrega al final sale primero (reintentos y
-        # respaldos se atienden de inmediato).
+        # (orden de lectura). Lo que se agrega al final sale primero (los
+        # reintentos se atienden de inmediato).
         queue: list[tuple[str, int]] = [(t, 0) for t in reversed(texts)]  # (texto, intento)
         # uid de BatchGenerator -> (texto, intento, tokens generados hasta ahora)
         active: dict[int, tuple[str, int, list[int]]] = {}
@@ -360,11 +368,6 @@ class Translator:
                     # Se guarda apenas termina, sin esperar al resto del batch.
                     self.cache.put(text, result)
                     self.generated += 1
-                    # on_done permite encolar al instante el respaldo de un párrafo
-                    # cuyo Markdown llegó roto (docstring, punto 7).
-                    extra = on_done(text, result) if on_done else []
-                    queue.extend((t, 0) for t in reversed(extra))  # van primero
-                    total += len(extra)
                     done += 1
                     now = time.time()
                     if now - last_report >= PROGRESS_EVERY_S or done == total:
@@ -424,10 +427,12 @@ def is_skipped(node) -> bool:
 # ─── Unidades de traducción ────────────────────────────────────────────────────
 #
 # Estrategia por bloque (párrafo, título, celda...), de mejor a peor:
-#   1. "md":    cursiva/negrita como Markdown (*x*, **x**), que el modelo respeta;
-#               se valida la salida y se reconstruyen los elementos originales.
-#   2. "plain": si el modelo rompe los marcadores, el bloque entero como texto
-#               plano (se pierde el formato inline de ese bloque, no la calidad).
+#   1. "md":    cursiva/negrita como Markdown (*x*, **x**), que el modelo respeta
+#               en general; la salida se vuelve a convertir en las etiquetas
+#               originales (md_to_nodes).
+#   2. "plain": bloques sin cursiva/negrita: el texto entero. Si el modelo agrega
+#               Markdown por su cuenta (p. ej. pone un título en cursiva), también
+#               se convierte en etiquetas: nunca quedan asteriscos en el libro.
 #   3. "nodes": bloques con links, notas, <br>, imágenes o anclas (id):
 #               cada fragmento de texto por separado, para no perder nada.
 #
@@ -438,8 +443,9 @@ def is_skipped(node) -> bool:
 #
 # Por qué Markdown: probado con el modelo real, las etiquetas tipo <g1>…</g1>
 # o <em>…</em> se descartaban casi siempre, mientras que *…* se conservaba en
-# la mayoría de los párrafos. Cuando no se conserva, md_marks_valid/decode_md
-# lo detectan y se usa el respaldo "plain".
+# la mayoría de los párrafos. El Markdown es solo el formato de ida y vuelta
+# con el modelo: md_to_nodes lo convierte siempre en HTML, aunque el modelo
+# haya cambiado algún marcador.
 
 def collect_units(soup) -> list:
     """Devuelve unidades a traducir en orden de documento:
@@ -529,70 +535,96 @@ def encode_md(target: Tag) -> str:
     return walk(target)
 
 
-def md_marks_valid(text: str, marks: list[str]) -> bool:
-    """¿El Markdown de `text` abre/cierra exactamente los marcadores `marks`
-    (en orden de apertura)?
-
-    Es la misma validación que decode_md, pero solo necesita los marcadores
-    (no el árbol HTML): translate_many la usa al terminar cada texto para
-    decidir al instante si hace falta el respaldo en texto plano."""
-    stack: list[str] = []
-    opened = 0
-    for m in re.finditer(r"\*\*|\*", text):
-        mark = m.group(0)
-        if stack and stack[-1] == mark:
-            stack.pop()
-        elif opened < len(marks) and marks[opened] == mark:
-            stack.append(mark)
-            opened += 1
-        else:
-            return False
-    return not stack and opened == len(marks)
+MD_RE = re.compile(r"\*\*|\*")
 
 
-def decode_md(text: str, elements: list[Tag], soup) -> list | None:
-    """Reconstruye nodos desde Markdown. None si no coincide con `elements`.
-
-    El n-ésimo marcador que se abre corresponde al n-ésimo elemento original,
-    del que se copian nombre y atributos (clases, estilos). Si el modelo quitó,
-    agregó o cambió algún marcador, no hay correspondencia segura y se
-    devuelve None en vez de adivinar."""
+def parse_md(text: str) -> list | None:
+    """Árbol [texto | (marca, hijos)] si los * de `text` están bien cerrados,
+    o None si no (un * suelto o cierres cruzados como *a **b* c**)."""
     root: list = []
     stack: list[tuple[str, list]] = [("", root)]
-    opened = 0
-    opened_index: list[int] = []
     pos = 0
-    for m in re.finditer(r"\*\*|\*", text):
+    for m in MD_RE.finditer(text):
         if text[pos:m.start()]:
-            stack[-1][1].append(NavigableString(text[pos:m.start()]))
+            stack[-1][1].append(text[pos:m.start()])
         pos = m.end()
         mark = m.group(0)
         if stack[-1][0] == mark:
-            _, children = stack.pop()
-            src = elements[opened_index.pop()]
-            new = soup.new_tag(src.name, attrs=dict(src.attrs))
-            for c in children:
-                new.append(c)
-            stack[-1][1].append(new)
+            stack[-2][1].append(stack.pop())
+        elif any(open_mark == mark for open_mark, _ in stack[1:]):
+            return None
         else:
-            if opened >= len(elements) or MD_TAGS[elements[opened].name] != mark:
-                return None
-            opened_index.append(opened)
-            opened += 1
             stack.append((mark, []))
     if text[pos:]:
-        stack[-1][1].append(NavigableString(text[pos:]))
-    if len(stack) != 1 or opened != len(elements):
-        return None
-    return root
+        stack[-1][1].append(text[pos:])
+    return root if len(stack) == 1 else None
 
 
-def leaf_inline(target: Tag, exclude_md: bool) -> list[tuple[str, dict, str]]:
-    """Elementos inline sin hijos (nombre, attrs, texto) que el modo md/plain
-    no reconstruye: se intentan restaurar después con restore_inline()."""
-    return [(t.name, dict(t.attrs), t.get_text()) for t in target.find_all(True)
-            if not t.find(True) and t.get_text().strip()
-            and not (exclude_md and t.name in MD_TAGS)]
+def md_to_nodes(text: str, soup, elements: list[Tag]) -> tuple[list, set[int]]:
+    """Convierte la salida del modelo (texto con Markdown) en nodos HTML.
+    Devuelve (nodos, ids de los elementos de `elements` reutilizados).
+
+    Tolerante a propósito: el modelo a menudo agrega, quita o mueve algún
+    marcador (en el libro de prueba, en ~40% de los párrafos con cursiva).
+    Exigir que coincidan exactamente con el original hacía descartar todo el
+    formato del párrafo, y aceptar el texto tal cual dejaba asteriscos en el
+    libro. En cambio:
+    - Cada tramo *x* / **x** usa el siguiente elemento original del mismo tipo
+      (copiando nombre y atributos, p. ej. <em class="titulo">); si ya no
+      quedan, un <em>/<strong> genérico (el modelo puso en cursiva algo que
+      el original marcaba de otra forma, como un título entre ›comillas‹).
+    - Si los marcadores no están bien cerrados, se eliminan: se pierde ese
+      formato, nunca el texto, y no queda ningún asterisco suelto.
+    Los elementos originales que no se reutilizaron los puede recuperar
+    restore_inline() si su texto aparece literal en la traducción."""
+    tree = parse_md(text)
+    if tree is None:
+        return [NavigableString(MD_RE.sub("", text))], set()
+    pools = {mark: deque(e for e in elements if MD_TAGS[e.name] == mark)
+             for mark in set(MD_TAGS.values())}
+    used: set[int] = set()
+
+    def plain_text(items) -> str:
+        return "".join(it if isinstance(it, str) else plain_text(it[1]) for it in items)
+
+    def build(items) -> list:
+        out = []
+        for it in items:
+            if isinstance(it, str):
+                out.append(NavigableString(it))
+                continue
+            mark, children = it
+            inner = build(children)
+            if not plain_text(children).strip():
+                out.extend(inner)  # "**" vacío: no crear una etiqueta vacía
+                continue
+            if pools[mark]:
+                src = pools[mark].popleft()
+                used.add(id(src))
+                tag = soup.new_tag(src.name, attrs=dict(src.attrs))
+            else:
+                tag = soup.new_tag("em" if mark == "*" else "strong")
+            for n in inner:
+                tag.append(n)
+            out.append(tag)
+        return out
+
+    return build(tree), used
+
+
+def leaf_inline(target: Tag) -> list[Tag]:
+    """Elementos inline sin hijos y con texto: los candidatos a restore_inline()."""
+    return [t for t in target.find_all(True) if not t.find(True) and t.get_text().strip()]
+
+
+def inside(node, name: str, stop: Tag) -> bool:
+    """¿`node` está dentro de un elemento `name`, sin pasar de `stop`?"""
+    for p in node.parents:
+        if p is stop:
+            return False
+        if p.name == name:
+            return True
+    return False
 
 
 def restore_inline(target: Tag, originals: list[tuple[str, dict, str]], soup):
@@ -602,12 +634,15 @@ def restore_inline(target: Tag, originals: list[tuple[str, dict, str]], soup):
     Funciona porque lo que suele llevar formato tipográfico (siglas, cifras,
     títulos de obras) casi nunca se traduce: si el texto exacto aparece en la
     salida, es seguro volver a envolverlo. Si no aparece, se pierde solo el
-    estilo, nunca el texto."""
+    estilo, nunca el texto. No envuelve texto que ya está dentro de un
+    elemento del mismo tipo (evita <em><em>x</em></em>)."""
     restored: set[int] = set()
     for name, attrs, text in originals:
         pat = re.compile(r"(?<!\w)" + re.escape(text.strip()) + r"(?!\w)")
         for node in target.find_all(string=True):
             if type(node) is not NavigableString or id(node.parent) in restored:
+                continue
+            if inside(node, name, target):
                 continue
             m = pat.search(str(node))
             if not m:
@@ -621,62 +656,62 @@ def restore_inline(target: Tag, originals: list[tuple[str, dict, str]], soup):
             break
 
 
-def translate_string(node: NavigableString, lookup: Lookup) -> bool:
+def fill_block(target: Tag, text: str, soup, source_has_stars: bool):
+    """Reemplaza el contenido de `target` por la traducción `text`.
+
+    Si el original no tenía asteriscos, los de la salida son Markdown (nuestro
+    o agregado por el modelo) y se convierten en etiquetas; si los tenía (p. ej.
+    marcas de notas al pie), se dejan como texto."""
+    elements = md_elements(target)
+    originals = leaf_inline(target)
+    if source_has_stars:
+        nodes, used = [NavigableString(text)], set()
+    else:
+        nodes, used = md_to_nodes(text, soup, elements)
+    target.clear()
+    for n in nodes:
+        target.append(n)
+    restore_inline(target, [(t.name, dict(t.attrs), t.get_text())
+                            for t in originals if id(t) not in used], soup)
+
+
+def translate_string(node: NavigableString, lookup: Lookup, soup=None) -> bool:
     # Solo el núcleo va al modelo (que recorta espacios); los espacios del borde
     # se reponen, así no se pegan palabras con la etiqueta vecina.
     lead, core, trail = split_ws(str(node))
     result = lookup(core)
     if result is None:
         return False
-    node.replace_with(NavigableString(lead + result + trail))
+    text = lead + result + trail
+    if "*" in str(node) or not MD_RE.search(result):
+        node.replace_with(NavigableString(text))
+    elif soup is None or any(p.name in MD_TAGS for p in node.parents if p.name):
+        # Ya está dentro de una cursiva/negrita: el Markdown del modelo sobra
+        node.replace_with(NavigableString(MD_RE.sub("", text)))
+    else:
+        node.replace_with(*md_to_nodes(text, soup, [])[0])
     return True
 
 
-def translate_plain(target: Tag, lookup: Lookup, soup) -> bool:
-    lead, core, trail = split_ws(target.get_text())
-    result = lookup(core)
-    if result is None:
-        return False
-    originals = leaf_inline(target, exclude_md=False)
-    target.clear()
-    target.append(NavigableString(lead + result + trail))
-    restore_inline(target, originals, soup)
-    return True
-
-
-def translate_block(block: Tag, lookup: Lookup, soup, on_md: OnMd | None = None) -> bool:
+def translate_block(block: Tag, lookup: Lookup, soup) -> bool:
     """Aplica la traducción a un bloque. `lookup(texto)` devuelve la traducción
     o None si todavía no existe (en ese caso el bloque queda sin cambios).
-    Devuelve True si el bloque quedó completamente traducido.
-
-    `on_md` avisa qué marcadores espera cada texto md y cuál sería su
-    respaldo, para que run() pueda pedir el respaldo apenas llegue un
-    resultado con el Markdown roto (docstring, punto 7)."""
+    Devuelve True si el bloque quedó completamente traducido."""
     target = unwrap_target(block)
     mode = block_mode(target)
-    if mode == "md":
-        lead, core, trail = split_ws(encode_md(target))
-        elements = md_elements(target)
-        if on_md:
-            on_md(core, [MD_TAGS[e.name] for e in elements], split_ws(target.get_text())[1])
+    if mode in ("md", "plain"):
+        source = encode_md(target) if mode == "md" else target.get_text()
+        lead, core, trail = split_ws(source)
         result = lookup(core)
         if result is None:
             return False
-        nodes = decode_md(lead + result + trail, elements, soup)
-        if nodes is not None:
-            originals = leaf_inline(target, exclude_md=True)
-            target.clear()
-            for n in nodes:
-                target.append(n)
-            restore_inline(target, originals, soup)
-            return True
-        mode = "plain"  # el modelo rompió los marcadores
-    if mode == "plain":
-        return translate_plain(target, lookup, soup)
+        fill_block(target, lead + result + trail, soup,
+                   source_has_stars="*" in target.get_text())
+        return True
     ok = True
     for s in [s for s in target.find_all(string=True)
               if type(s) is NavigableString and has_letters(s) and not is_skipped(s)]:
-        ok &= translate_string(s, lookup)
+        ok &= translate_string(s, lookup, soup)
     return ok
 
 
@@ -758,9 +793,51 @@ def ncx_label_nodes(ncx_tree) -> list:
             if t.text and has_letters(t.text)]
 
 
+# ─── Confirmación ──────────────────────────────────────────────────────────────
+
+def is_interactive() -> bool:
+    """¿Se puede preguntar al usuario? Requiere terminal en la entrada y en la
+    salida (si la salida va a un log, la pregunta no se vería) y que el proceso
+    esté en primer plano: un proceso lanzado con `&` que lee la terminal queda
+    suspendido por el sistema en vez de fallar."""
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return False
+    try:
+        return os.getpgrp() == os.tcgetpgrp(sys.stdin.fileno())
+    except OSError:
+        return False
+
+
+def confirm_plan(input_epub: Path, src_lang: str, tgt_lang: str, work_dir: Path,
+                 n_files: int, units: int, units_pending: int, texts_pending: int) -> bool:
+    """Muestra qué se va a hacer y pregunta si empezar. Sin terminal, termina
+    con un error que indica usar -q (nunca se queda esperando una respuesta)."""
+    est_min = texts_pending * REF_SECONDS_PER_TEXT / 60
+    print("Plan de traducción")
+    print(f"  Libro:      {input_epub.name} ({n_files} archivos HTML)")
+    print(f"  Idiomas:    {src_lang} → {tgt_lang}")
+    print(f"  Modelo:     {MODEL_NAME} (batch {BATCH_SIZE})")
+    print(f"  Trabajo:    {work_dir}")
+    print(f"  Unidades:   {units} en total, {units - units_pending} ya traducidas, "
+          f"{units_pending} pendientes")
+    print(f"  A traducir: {texts_pending} textos, ~{max(est_min, 1):.0f} min estimados "
+          f"(referencia: {REF_SECONDS_PER_TEXT} s/texto en M5 Pro, batch 16)")
+    print("  Se puede interrumpir con Ctrl+C y retomar después sin perder lo traducido.")
+    if not is_interactive():
+        print("\n❌ No hay una terminal para confirmar (¿en segundo plano o con la salida "
+              "a un archivo?). Usa -q para empezar sin preguntar.")
+        sys.exit(2)
+    try:
+        answer = input("\n¿Empezar la traducción? [s/N]: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return False
+    return answer in {"s", "si", "sí", "y", "yes"}
+
+
 # ─── Pipeline ──────────────────────────────────────────────────────────────────
 
-def apply_translations(html_file: Path, lookup: Lookup, on_md: OnMd | None = None):
+def apply_translations(html_file: Path, lookup: Lookup):
     """Parsea un HTML y aplica las traducciones disponibles.
     Devuelve (soup, texto_original, unidades, unidades_incompletas).
 
@@ -772,15 +849,18 @@ def apply_translations(html_file: Path, lookup: Lookup, on_md: OnMd | None = Non
     units = collect_units(soup)
     incomplete = 0
     for u in units:
-        ok = (translate_block(u, lookup, soup, on_md) if isinstance(u, Tag)
-              else translate_string(u, lookup))
+        ok = (translate_block(u, lookup, soup) if isinstance(u, Tag)
+              else translate_string(u, lookup, soup))
         incomplete += not ok
     return soup, text, len(units), incomplete
 
 
-def run(input_epub: Path, src_lang: str, tgt_lang: str):
-    """Extrae el EPUB y traduce a la caché todo lo que falte."""
+def run(input_epub: Path, src_lang: str, tgt_lang: str, ask: bool = True) -> bool:
+    """Extrae el EPUB y traduce a la caché todo lo que falte.
+    Con `ask`, antes de cargar el modelo muestra el plan y pide confirmación.
+    Devuelve False si el usuario decide no empezar."""
     work_dir, src_dir = book_dirs(input_epub)
+    created_work_dir = not work_dir.exists()
     extract_epub(input_epub, src_dir)
 
     cache = TranslationCache(cache_path(work_dir, src_lang, tgt_lang), src_lang, tgt_lang)
@@ -790,24 +870,10 @@ def run(input_epub: Path, src_lang: str, tgt_lang: str):
     ncx_texts = ([split_ws(t.text)[1] for t in ncx_label_nodes(etree.parse(str(ncx)))]
                  if ncx and ncx.exists() else [])
 
-    # Por cada bloque md pendiente: marcadores esperados y su respaldo en texto plano,
-    # para pedir el respaldo apenas el modelo rompa el formato (sin esperar otra ronda).
-    md_info: dict[str, tuple[list[str], str]] = {}
-
-    def on_md(core: str, marks: list[str], plain: str):
-        md_info[core] = (marks, plain)
-
-    def on_done(text: str, result: str) -> list[str]:
-        info = md_info.get(text)
-        if info and not md_marks_valid(result, info[0]) and cache.get(info[1]) is None:
-            return [info[1]]
-        return []
-
     # Rondas: cada una recorre el libro con un lookup que anota lo que falta en la
     # caché (en orden de lectura, sin duplicados) y lo traduce. Normalmente basta
-    # una: los respaldos se encolan durante la misma ronda gracias a on_done. Las
-    # siguientes cubren casos como un md roto cacheado en una ejecución anterior,
-    # cuyo respaldo recién aparece al volver a aplicar. Máximo 3 para no ciclar.
+    # una; otra ronda solo hace falta si alguna traducción se rehízo y cambió lo
+    # que se pide. Máximo 3 para no ciclar.
     start = time.time()
     failed: set[str] = set()
     try:
@@ -827,14 +893,26 @@ def run(input_epub: Path, src_lang: str, tgt_lang: str):
 
             for t in ncx_texts:  # títulos del índice primero (cortos, útiles en un parcial)
                 lookup(t)
-            total = 0
+            total = incomplete = 0
             for f in html_files:
-                total += apply_translations(f, lookup, on_md)[2]
+                _, _, n, inc = apply_translations(f, lookup)
+                total += n
+                incomplete += inc
             if not missing:
                 break
+            # La confirmación va después de planificar (para mostrar cuánto falta)
+            # y antes de cargar el modelo, que es lo costoso.
+            if ask and round_no == 1 and not confirm_plan(
+                    input_epub, src_lang, tgt_lang, work_dir, len(html_files),
+                    total, incomplete, len(missing)):
+                cache.close()
+                if created_work_dir:
+                    shutil.rmtree(work_dir)  # no dejar rastros de un libro que no se tradujo
+                print("Cancelado. No se tradujo nada.")
+                return False
             print(f"[translate] ronda {round_no}: {total} unidades, "
                   f"{len(missing)} textos pendientes.", flush=True)
-            tr.translate_many(list(missing), failed, on_done)
+            tr.translate_many(list(missing), failed)
     except KeyboardInterrupt:
         # Ctrl+C es seguro: todo lo terminado ya está en disco (flush por entrada).
         cache.close()
@@ -847,6 +925,7 @@ def run(input_epub: Path, src_lang: str, tgt_lang: str):
           f"({tr.generated} textos traducidos ahora, {len(failed)} con error)")
     if failed:
         print("   ⚠ Hay textos sin traducir; relanza para reintentarlos.")
+    return True
 
 
 def main():
@@ -858,6 +937,9 @@ def main():
     parser.add_argument("--tgt", default=DEFAULT_TARGET_LANG, help="idioma destino (ej. es)")
     parser.add_argument("--batch", type=int, default=BATCH_SIZE,
                         help=f"párrafos en paralelo (default {BATCH_SIZE})")
+    parser.add_argument("-q", "--quiet", action="store_true",
+                        help="empezar sin mostrar el plan ni pedir confirmación "
+                             "(necesario en segundo plano o con la salida a un log)")
     args = parser.parse_args()
     if args.batch < 1:
         parser.error("--batch debe ser >= 1")
@@ -873,7 +955,8 @@ def main():
     print(f"Model:  {MODEL_NAME} (MLX, batch {BATCH_SIZE})")
     print(f"Work:   {book_dirs(input_epub)[0]}\n")
 
-    run(input_epub, args.src, args.tgt)
+    if not run(input_epub, args.src, args.tgt, ask=not args.quiet):
+        return
     print(f"   Para armar el EPUB: .venv/bin/python build_epub.py {shlex.quote(str(args.input))}")
 
 
