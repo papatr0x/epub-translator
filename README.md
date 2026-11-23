@@ -14,29 +14,64 @@ envía a ningún servicio.
 - **EPUB parcial:** puedes armar un EPUB con los capítulos ya traducidos mientras la
   traducción sigue corriendo.
 
-## Inicio rápido
-
-```bash
-git clone https://github.com/papatr0x/epub-translator.git
-cd epub-translator
-python3 -m venv .venv
-.venv/bin/pip install -r requirements.txt
-
-.venv/bin/python translate_epub.py libro.epub   # muestra el plan y pide confirmación
-.venv/bin/python build_epub.py libro.epub       # genera "libro (ES).epub"
-```
-
-La primera vez se descarga el modelo de Hugging Face (~2 GB), sin necesidad de cuenta.
+¿No tienes un Mac con Apple Silicon? Usa el [notebook para Google Colab](#google-colab).
 
 ## Requisitos
 
 - Mac con Apple Silicon (M1 o posterior). MLX no funciona en Intel, Linux ni Windows.
-- Python 3.10 o posterior (probado con 3.14).
+- Python 3.10 o posterior (probado con 3.14), o [uv](https://docs.astral.sh/uv/).
 - Unos 3 GB de memoria libre (medido con el lote por defecto, 16).
 - El libro en formato **EPUB**. Un PDF hay que convertirlo antes, por ejemplo con
   [Calibre](https://calibre-ebook.com): `ebook-convert libro.pdf libro.epub`.
 
+## Instalación
+
+Descarga el código:
+
+```bash
+git clone https://github.com/papatr0x/epub-translator.git
+cd epub-translator
+```
+
+Luego crea un entorno virtual con las dependencias. Elige una de las dos opciones.
+
+### Opción A: venv (incluido en Python)
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+`source .venv/bin/activate` activa el entorno solo en esa terminal. En una terminal nueva hay
+que volver a activarlo (desde la carpeta del proyecto) antes de usar los scripts. Para salir
+del entorno: `deactivate`.
+
+### Opción B: uv
+
+```bash
+uv venv
+uv pip install -r requirements.txt
+```
+
+Con uv no hace falta activar nada: `uv run` usa automáticamente el `.venv` de la carpeta.
+
+### Primera ejecución
+
+La primera traducción descarga el modelo de Hugging Face (~2 GB) a `~/.cache/huggingface/`.
+No hace falta cuenta. Las siguientes ejecuciones lo usan desde ahí.
+
 ## Uso
+
+Los ejemplos usan `python` con el entorno **activado** (opción A). Con **uv** (opción B),
+reemplaza `python` por `uv run`:
+
+| venv activado | uv |
+|---|---|
+| `python translate_epub.py libro.epub` | `uv run translate_epub.py libro.epub` |
+| `python build_epub.py libro.epub` | `uv run build_epub.py libro.epub` |
+
+Sin activar el entorno también funciona con la ruta completa: `.venv/bin/python translate_epub.py …`.
 
 El proceso tiene dos pasos independientes: **traducir** (lento, llena una caché) y **armar**
 el EPUB (instantáneo, lee la caché). Puedes armar el EPUB tantas veces como quieras.
@@ -44,7 +79,7 @@ el EPUB (instantáneo, lee la caché). Puedes armar el EPUB tantas veces como qu
 ### 1. Traducir
 
 ```bash
-.venv/bin/python translate_epub.py libro.epub
+python translate_epub.py libro.epub
 ```
 
 Antes de cargar el modelo muestra qué va a hacer y pregunta si empezar:
@@ -64,14 +99,17 @@ Para dejarlo corriendo en segundo plano usa `-q`, que empieza sin preguntar (sin
 se detiene, porque no hay dónde mostrar la pregunta):
 
 ```bash
-.venv/bin/python -u translate_epub.py libro.epub -q > translation.log 2>&1 &
+python -u translate_epub.py libro.epub -q > translation.log 2>&1 &        # venv activado
+uv run python -u translate_epub.py libro.epub -q > translation.log 2>&1 & # uv
 tail -f translation.log
 ```
+
+`-u` hace que el progreso se escriba en el log al instante, en vez de acumularse.
 
 ### 2. Armar el EPUB
 
 ```bash
-.venv/bin/python build_epub.py libro.epub
+python build_epub.py libro.epub
 ```
 
 - Si la traducción terminó, genera `libro (ES).epub`.
@@ -107,13 +145,45 @@ Todo queda en `work/<nombre del libro>/`:
 | `cache_<src>-<tgt>.jsonl` | Las traducciones: es el progreso. Si lo borras, se empieza de cero |
 | `build/` | El contenido del último EPUB armado |
 
+## Google Colab
+
+[`epub_translator_colab.ipynb`](epub_translator_colab.ipynb) hace lo mismo en una GPU NVIDIA de
+Google Colab, sin instalar nada en tu computadora. Usa el mismo método de traducción (párrafos,
+formato, caché retomable y EPUB parcial), pero con el modelo original de Google mediante
+[transformers](https://huggingface.co/docs/transformers) en vez de MLX.
+
+[![Abrir en Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/papatr0x/epub-translator/blob/main/epub_translator_colab.ipynb)
+
+Antes de usarlo:
+
+1. **GPU:** en Colab, *Entorno de ejecución → Cambiar tipo de entorno de ejecución → T4 GPU*
+   (o L4/A100 con Colab Pro).
+2. **Licencia:** el modelo [google/translategemma-4b-it](https://huggingface.co/google/translategemma-4b-it)
+   requiere iniciar sesión en Hugging Face y aceptar los términos de Gemma.
+3. **Token:** crea un token de lectura en [huggingface.co/settings/tokens](https://huggingface.co/settings/tokens)
+   y guárdalo en Colab, en el panel 🔑 *Secretos*, con el nombre `HF_TOKEN`. Si el token es
+   *fine-grained*, activa el acceso de lectura a los repos con licencia ("gated").
+4. **El libro:** súbelo a tu Google Drive, o deja que el notebook te pida subirlo.
+
+Luego ejecuta las celdas en orden. La caché se guarda en Google Drive
+(`MyDrive/epub-translator/work/`): si Colab se desconecta, vuelve a ejecutar las celdas y sigue
+donde quedó. La celda 7 arma el EPUB, completo o parcial, en cualquier momento.
+
+Notas:
+- La T4 gratuita no soporta bf16 y el notebook usa fp16, con el que Gemma a veces produce
+  salidas vacías o sin sentido. La celda 5 hace una prueba y avisa si pasa; en ese caso usa una
+  GPU L4 o A100.
+- El notebook no usa `requirements.txt`: instala sus dependencias en la celda 2.
+
 ## Cómo funciona
 
 1. **Unidades:** cada párrafo, título o celda es una unidad. Traducir el párrafo completo le
    da contexto al modelo, y reemplazar solo su texto conserva el HTML original.
 2. **Formato:** la cursiva y la negrita viajan como Markdown (`*x*`, `**x**`), que el modelo
-   respeta mucho mejor que las etiquetas HTML. Si lo rompe, ese párrafo se traduce como texto
-   plano. Los párrafos con links o notas al pie se traducen por fragmentos para no perderlos.
+   respeta mucho mejor que las etiquetas HTML. Al volver, el Markdown se convierte otra vez en
+   las etiquetas originales, aunque el modelo haya cambiado algún marcador: al libro nunca
+   llegan asteriscos. Los párrafos con links o notas al pie se traducen por fragmentos para
+   no perderlos.
 3. **Validación:** si una salida entra en bucle, se corta o es una "explicación" en vez de una
    traducción, se reintenta con penalización de repetición. Si vuelve a fallar, se conserva el
    texto original y queda anotado en el log.
@@ -128,7 +198,8 @@ El detalle de las optimizaciones (por qué es rápido, cómo retoma) está en el
 
 - Es traducción automática: sirve para lectura personal, no tiene calidad editorial. Los
   coloquialismos y juegos de palabras suelen salir literales.
-- Si el modelo no respeta la cursiva de un párrafo, ese párrafo pierde el formato, nunca el texto.
+- A veces el modelo quita una cursiva al traducir. Se recupera si su texto queda igual (nombres,
+  títulos); si no, se pierde ese formato, nunca el texto.
 - Los fragmentos muy cortos y sin contexto que el modelo no logra traducir (letras decorativas,
   un "th" en superíndice) se dejan en el idioma original.
 - La estimación de tiempo usa como referencia un M5 Pro; en otras máquinas varía.
