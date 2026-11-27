@@ -21,12 +21,16 @@ Diseño
   libro con capítulos faltantes en el medio sería confuso de leer.
 - Los archivos sin texto (portada SVG) se copian sin re-serializar, porque
   html.parser pasaría a minúsculas atributos SVG como viewBox y rompería la imagen.
+  Si la portada SVG tiene texto (un <title>), se traduce y restore_svg_case
+  devuelve las mayúsculas a las etiquetas y atributos SVG.
+- fit_images agrega a cada CSS del libro un alto máximo para las imágenes, para
+  que en una ventana baja no se corten y sigan en la página siguiente.
 
 Uso:
-    .venv/bin/python build_epub.py <entrada.epub> [salida.epub] [--src de] [--tgt es]
+    .venv/bin/python build_epub.py <entrada.epub> [salida.epub] --src <idioma> [--tgt es]
 
 Ejemplo:
-    .venv/bin/python build_epub.py input.epub
+    .venv/bin/python build_epub.py input.epub --src de
 """
 
 import argparse
@@ -39,14 +43,34 @@ from pathlib import Path
 from lxml import etree
 
 from translate_epub import (
-    DEFAULT_SOURCE_LANG, DEFAULT_TARGET_LANG, TranslationCache, apply_translations,
-    book_dirs, cache_path, find_ncx, find_opf, ncx_label_nodes, resolve_href,
-    spine_files, split_ws,
+    DEFAULT_TARGET_LANG, TranslationCache, apply_translations,
+    add_model_argument, book_dirs, cache_path, find_ncx, find_opf, load_notes,
+    ncx_label_nodes, resolve_href, resolve_model, spine_files, split_ws,
 )
 
 DOCTYPE_XHTML = ('<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN" '
                  '"http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd">\n')
 PARTIAL_SUFFIX = " (parcial)"
+# Agregado a cada CSS del libro: muchos EPUB no limitan el alto de las
+# imágenes y, en una ventana baja, una imagen se corta y sigue en la página
+# siguiente. En Apple Books 100vh es la ventana entera: se descuentan ~160px
+# de su título y número de página, y 2em de márgenes del propio libro.
+FIT_IMAGES_CSS = ("\n/* epub translator: las imágenes caben en la página */\n"
+                  "img { max-width: 100%; max-height: calc(100vh - 160px - 2em); object-fit: contain; }\n")
+
+# html.parser pasa a minúsculas nombres de etiquetas y atributos, pero en SVG
+# (XML) importan las mayúsculas: sin viewBox/preserveAspectRatio la portada se
+# deforma. Nombres SVG con mayúsculas, para restaurarlos al re-serializar.
+SVG_NAMES = {n.lower(): n for n in (
+    "viewBox preserveAspectRatio gradientUnits gradientTransform patternUnits "
+    "patternContentUnits patternTransform clipPathUnits maskUnits maskContentUnits "
+    "markerUnits markerWidth markerHeight refX refY textLength lengthAdjust "
+    "startOffset spreadMethod stdDeviation baseFrequency numOctaves "
+    "primitiveUnits filterUnits pathLength attributeName repeatCount "
+    "linearGradient radialGradient clipPath foreignObject textPath "
+    "feGaussianBlur feColorMatrix feOffset feBlend feFlood feComposite feMerge "
+    "feMergeNode feImage feTurbulence animateTransform"
+).split()}
 
 
 # ─── Serialización XML válida ──────────────────────────────────────────────────
@@ -56,6 +80,22 @@ def get_doctype(text: str) -> str:
     para no imponer uno distinto al del libro."""
     m = re.search(r"<!DOCTYPE[^>]*>", text, re.IGNORECASE)
     return (re.sub(r"\s+", " ", m.group(0)) + "\n") if m else DOCTYPE_XHTML
+
+
+def fit_images(build_dir: Path):
+    """Agrega FIT_IMAGES_CSS a todas las hojas de estilo del libro."""
+    for css in build_dir.rglob("*.css"):
+        with css.open("a", encoding="utf-8") as f:
+            f.write(FIT_IMAGES_CSS)
+
+
+def restore_svg_case(tree):
+    """Devuelve a SVG las mayúsculas que html.parser le quitó (ver SVG_NAMES)."""
+    for el in tree.iter("{http://www.w3.org/2000/svg}*"):
+        ns, _, local = el.tag.rpartition("}")
+        el.tag = ns + "}" + SVG_NAMES.get(local, local)
+        for name in [a for a in el.attrib if a in SVG_NAMES]:
+            el.set(SVG_NAMES[name], el.attrib.pop(name))
 
 
 def fix_xhtml(text: str, doctype: str) -> bytes:
@@ -70,6 +110,7 @@ def fix_xhtml(text: str, doctype: str) -> bytes:
     text = '<?xml version="1.0" encoding="utf-8"?>\n' + text
     try:
         tree = etree.fromstring(text.encode("utf-8"))
+        restore_svg_case(tree)
         result = etree.tostring(tree, xml_declaration=True, encoding="utf-8")
     except etree.XMLSyntaxError as e:
         print(f"    ⚠ XML inválido, se guarda sin re-serializar: {e}", flush=True)
@@ -180,16 +221,27 @@ def build(input_epub: Path, output_epub: Path | None, src_lang: str, tgt_lang: s
     if not (src_dir / "mimetype").exists() or not cpath.exists():
         print(f"❌ No hay traducciones para {input_epub.name}. Corre primero translate_epub.py.")
         sys.exit(1)
-    cache = TranslationCache(cpath, src_lang, tgt_lang, read_only=True)
+    # Las mismas notas que usó translate_epub.py: forman parte de la clave de caché
+    cache = TranslationCache(cpath, src_lang, tgt_lang, read_only=True,
+                             notes=load_notes(input_epub, src_lang, tgt_lang))
 
     # Aplicar traducciones en orden de lectura y buscar el primer capítulo incompleto.
     # Un archivo sin texto (n == 0) cuenta como completo: no corta en la portada.
+    # Textos que el modelo no logró traducir: están en la caché con el original
+    # (el libro se arma igual), pero se avisa para que no pasen inadvertidos.
+    untranslated: set[str] = set()
+
+    def lookup(text: str) -> str | None:
+        if cache.is_failed(text):
+            untranslated.add(text)
+        return cache.get(text)
+
     spine = spine_files(src_dir, include_rest=False)
     rendered = {}
     cut = len(spine)
     units_total = units_done = 0
     for i, f in enumerate(spine):
-        soup, text, n, incomplete = apply_translations(f, cache.get)
+        soup, text, n, incomplete = apply_translations(f, lookup)
         rendered[f] = (soup, text, n)
         units_total += n
         units_done += n - incomplete
@@ -197,7 +249,7 @@ def build(input_epub: Path, output_epub: Path | None, src_lang: str, tgt_lang: s
             cut = i
     for f in spine_files(src_dir):
         if f not in rendered:  # HTML fuera del spine (nav, etc.)
-            soup, text, n, _ = apply_translations(f, cache.get)
+            soup, text, n, _ = apply_translations(f, lookup)
             rendered[f] = (soup, text, n)
 
     partial = cut < len(spine)
@@ -215,6 +267,7 @@ def build(input_epub: Path, output_epub: Path | None, src_lang: str, tgt_lang: s
     if build_dir.exists():
         shutil.rmtree(build_dir)
     shutil.copytree(src_dir, build_dir)
+    fit_images(build_dir)
 
     def in_build(path: Path) -> Path:
         return build_dir / path.relative_to(src_dir)
@@ -241,6 +294,9 @@ def build(input_epub: Path, output_epub: Path | None, src_lang: str, tgt_lang: s
           + (f", corta antes de {spine[cut].relative_to(src_dir)}" if partial else "")
           + f". Unidades traducidas: {units_done}/{units_total} "
             f"({units_done / max(units_total, 1):.0%} del libro).")
+    if untranslated:
+        print(f"[build] ⚠ {len(untranslated)} textos quedaron en el idioma original porque "
+              "el modelo no logró traducirlos; translate_epub.py los reintenta al relanzarlo.")
     assemble_epub(build_dir, output_epub)
     print(f"   Resultado: {output_epub}")
 
@@ -250,14 +306,17 @@ def main():
         description="Arma un EPUB (completo o parcial) con las traducciones disponibles.")
     parser.add_argument("input", type=Path, help="EPUB original (el mismo de translate_epub.py)")
     parser.add_argument("output", type=Path, nargs="?", help="EPUB de salida")
-    parser.add_argument("--src", default=DEFAULT_SOURCE_LANG, help="idioma origen (ej. de)")
+    parser.add_argument("--src", required=True,
+                        help="idioma origen, código ISO (ej. de, en, fr, pt-BR); obligatorio")
     parser.add_argument("--tgt", default=DEFAULT_TARGET_LANG, help="idioma destino (ej. es)")
+    add_model_argument(parser)
     args = parser.parse_args()
 
     input_epub = args.input.resolve()
     if not input_epub.exists():
         print(f"❌ No existe: {input_epub}")
         sys.exit(1)
+    print(f"Modelo: {resolve_model(input_epub, args.modelo)}")
     build(input_epub, args.output.resolve() if args.output else None, args.src, args.tgt)
 
 

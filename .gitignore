@@ -10,5 +10,8 @@ work/
 *.log
 
 # Notas locales y scripts obsoletos
+notas/
+*.notas.md
+.idea/
 CONTEXTO.md
 fix_epub.py
